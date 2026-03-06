@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 import json
-import os
 from io import BytesIO
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter, A4
@@ -10,6 +9,8 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+import gspread
+from google.oauth2.service_account import Credentials
 
 # Configuración de la página
 st.set_page_config(
@@ -18,36 +19,199 @@ st.set_page_config(
     layout="wide"
 )
 
-# Archivo para guardar datos
-DATA_FILE = "viaje_data.json"
-
 # Configuración de tarifas
 TARIFAS = {
     'transporte': 400,
-    'habitacion_sencilla': 600,
-    'habitacion_doble': 800,
-    'habitacion_triple': 1000
+    'habitacion_sencilla': 900,
+    'habitacion_doble': 1150,
+    'habitacion_triple': 1300
 }
 
-# Inicializar datos
-def inicializar_datos():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {
-        'clientes': {},
-        'configuracion': TARIFAS,
-        'fecha_viaje': None
-    }
+# ============================================
+# CONEXIÓN A GOOGLE SHEETS
+# ============================================
+@st.cache_resource
+def conectar_google_sheets():
+    """Conecta a Google Sheets usando las credenciales de Streamlit Secrets."""
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    client = gspread.authorize(creds)
+    return client
 
-# Guardar datos
-def guardar_datos(datos):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(datos, f, indent=2, ensure_ascii=False)
+def obtener_hojas():
+    """Obtiene las hojas de clientes y pagos."""
+    client = conectar_google_sheets()
+    spreadsheet = client.open("viaje_san_juan_data")
+    hoja_clientes = spreadsheet.worksheet("clientes")
+    hoja_pagos = spreadsheet.worksheet("pagos")
+    return hoja_clientes, hoja_pagos
 
-# Cargar datos
+# ============================================
+# FUNCIONES DE LECTURA/ESCRITURA EN GOOGLE SHEETS
+# ============================================
+def cargar_datos_sheets():
+    """Carga todos los datos desde Google Sheets y los convierte al formato interno."""
+    try:
+        hoja_clientes, hoja_pagos = obtener_hojas()
+        
+        # Leer clientes
+        registros_clientes = hoja_clientes.get_all_records()
+        
+        # Leer pagos
+        registros_pagos = hoja_pagos.get_all_records()
+        
+        # Construir estructura de datos interna
+        clientes = {}
+        for row in registros_clientes:
+            cid = str(row['cliente_id'])
+            clientes[cid] = {
+                'nombre': str(row.get('nombre', '')),
+                'telefono': str(row.get('telefono', '')),
+                'email': str(row.get('email', '')),
+                'asientos': int(row.get('asientos', 0)),
+                'habitaciones': {
+                    'sencillas': int(row.get('hab_sencillas', 0)),
+                    'dobles': int(row.get('hab_dobles', 0)),
+                    'triples': int(row.get('hab_triples', 0)),
+                },
+                'total_a_pagar': float(row.get('total_a_pagar', 0)),
+                'total_pagado': float(row.get('total_pagado', 0)),
+                'saldo_pendiente': float(row.get('saldo_pendiente', 0)),
+                'notas': str(row.get('notas', '')),
+                'fecha_registro': str(row.get('fecha_registro', '')),
+                'pagos': []
+            }
+        
+        # Asignar pagos a cada cliente
+        for pago_row in registros_pagos:
+            cid = str(pago_row['cliente_id'])
+            if cid in clientes:
+                clientes[cid]['pagos'].append({
+                    'fecha': str(pago_row.get('fecha', '')),
+                    'monto': float(pago_row.get('monto', 0)),
+                    'metodo': str(pago_row.get('metodo', '')),
+                    'referencia': str(pago_row.get('referencia', '')),
+                    'notas': str(pago_row.get('notas', '')),
+                    'timestamp': str(pago_row.get('timestamp', ''))
+                })
+        
+        return {'clientes': clientes, 'configuracion': TARIFAS, 'fecha_viaje': None}
+    
+    except Exception as e:
+        st.error(f"❌ Error al conectar con Google Sheets: {e}")
+        return {'clientes': {}, 'configuracion': TARIFAS, 'fecha_viaje': None}
+
+def guardar_cliente_sheets(cliente_id, cliente):
+    """Guarda o actualiza un cliente en Google Sheets."""
+    hoja_clientes, _ = obtener_hojas()
+    
+    fila = [
+        cliente_id,
+        cliente['nombre'],
+        cliente['telefono'],
+        cliente['email'],
+        cliente['asientos'],
+        cliente['habitaciones']['sencillas'],
+        cliente['habitaciones']['dobles'],
+        cliente['habitaciones']['triples'],
+        cliente['total_a_pagar'],
+        cliente['total_pagado'],
+        cliente['saldo_pendiente'],
+        cliente['notas'],
+        cliente['fecha_registro']
+    ]
+    
+    # Buscar si el cliente ya existe
+    try:
+        celda = hoja_clientes.find(cliente_id, in_column=1)
+        # Actualizar fila existente
+        rango = f"A{celda.row}:M{celda.row}"
+        hoja_clientes.update(rango, [fila])
+    except gspread.exceptions.CellNotFound:
+        # Agregar nueva fila
+        hoja_clientes.append_row(fila)
+
+def eliminar_cliente_sheets(cliente_id):
+    """Elimina un cliente y sus pagos de Google Sheets."""
+    hoja_clientes, hoja_pagos = obtener_hojas()
+    
+    # Eliminar de hoja clientes
+    try:
+        celda = hoja_clientes.find(cliente_id, in_column=1)
+        hoja_clientes.delete_rows(celda.row)
+    except gspread.exceptions.CellNotFound:
+        pass
+    
+    # Eliminar pagos del cliente
+    try:
+        registros_pagos = hoja_pagos.get_all_records()
+        filas_a_eliminar = []
+        for idx, pago in enumerate(registros_pagos, start=2):  # start=2 porque fila 1 son encabezados
+            if str(pago['cliente_id']) == cliente_id:
+                filas_a_eliminar.append(idx)
+        
+        # Eliminar de abajo hacia arriba para no alterar los índices
+        for fila in sorted(filas_a_eliminar, reverse=True):
+            hoja_pagos.delete_rows(fila)
+    except Exception:
+        pass
+
+def agregar_pago_sheets(cliente_id, pago):
+    """Agrega un pago a Google Sheets."""
+    _, hoja_pagos = obtener_hojas()
+    
+    fila = [
+        cliente_id,
+        pago['fecha'],
+        pago['monto'],
+        pago['metodo'],
+        pago['referencia'],
+        pago['notas'],
+        pago.get('timestamp', '')
+    ]
+    
+    hoja_pagos.append_row(fila)
+
+def eliminar_pago_sheets(cliente_id, indice_pago):
+    """Elimina un pago específico de Google Sheets."""
+    _, hoja_pagos = obtener_hojas()
+    
+    registros_pagos = hoja_pagos.get_all_records()
+    contador = 0
+    for idx, pago in enumerate(registros_pagos, start=2):
+        if str(pago['cliente_id']) == cliente_id:
+            if contador == indice_pago:
+                hoja_pagos.delete_rows(idx)
+                return
+            contador += 1
+
+def actualizar_totales_cliente(cliente_id, total_pagado, saldo_pendiente):
+    """Actualiza solo los totales de pago de un cliente."""
+    hoja_clientes, _ = obtener_hojas()
+    
+    try:
+        celda = hoja_clientes.find(cliente_id, in_column=1)
+        # Columnas J (total_pagado) y K (saldo_pendiente) = columnas 10 y 11
+        hoja_clientes.update_cell(celda.row, 10, total_pagado)
+        hoja_clientes.update_cell(celda.row, 11, saldo_pendiente)
+    except gspread.exceptions.CellNotFound:
+        pass
+
+# ============================================
+# INICIALIZAR DATOS
+# ============================================
+def recargar_datos():
+    """Recarga datos desde Google Sheets al session_state."""
+    st.session_state.datos = cargar_datos_sheets()
+
 if 'datos' not in st.session_state:
-    st.session_state.datos = inicializar_datos()
+    recargar_datos()
 
 datos = st.session_state.datos
 
@@ -55,7 +219,15 @@ datos = st.session_state.datos
 def generar_id():
     if not datos['clientes']:
         return "CLI001"
-    ultimo_id = max([int(k[3:]) for k in datos['clientes'].keys()])
+    ids_numericos = []
+    for k in datos['clientes'].keys():
+        try:
+            ids_numericos.append(int(k[3:]))
+        except ValueError:
+            continue
+    if not ids_numericos:
+        return "CLI001"
+    ultimo_id = max(ids_numericos)
     return f"CLI{str(ultimo_id + 1).zfill(3)}"
 
 # Función para calcular total
@@ -71,7 +243,6 @@ def generar_kardex_pdf(cliente_id, cliente):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
     
-    # Estilos
     styles = getSampleStyleSheet()
     titulo_style = ParagraphStyle(
         'CustomTitle',
@@ -94,10 +265,8 @@ def generar_kardex_pdf(cliente_id, cliente):
     
     normal_style = styles['Normal']
     
-    # Contenido del documento
     story = []
     
-    # Título principal
     titulo = Paragraph("🚌 KARDEX DE CLIENTE", titulo_style)
     story.append(titulo)
     story.append(Spacer(1, 0.2*inch))
@@ -270,7 +439,6 @@ def generar_kardex_pdf(cliente_id, cliente):
     story.append(Paragraph("_______________________________________________", footer_style))
     story.append(Paragraph("Sistema de Gestión de Viajes - Viaje San Juan de los Lagos dia Miercoles 01 abril 2026 ", footer_style))
     
-    # Construir PDF
     doc.build(story)
     buffer.seek(0)
     return buffer
@@ -315,8 +483,7 @@ def generar_kardex_cliente(cliente_id, cliente):
                 f"${cliente['habitaciones']['triples'] * TARIFAS['habitacion_triple']:,.2f}"
             ]
         }
-        df_reservas = pd.DataFrame(reservas)
-        df_reservas.to_excel(writer, sheet_name='Reservas y Costos', index=False)
+        pd.DataFrame(reservas).to_excel(writer, sheet_name='Reservas y Costos', index=False)
         
         # Hoja 3: Estado de Cuenta
         estado_cuenta = {
@@ -363,9 +530,20 @@ def generar_kardex_cliente(cliente_id, cliente):
     output.seek(0)
     return output
 
+# ============================================
+# INTERFAZ PRINCIPAL
+# ============================================
+
 # Título principal
 st.title("🚌 Viaje San Juan de los Lagos dia Miercoles 01 abril 2026")
 st.markdown("---")
+
+# Botón para recargar datos desde Google Sheets
+with st.sidebar:
+    if st.button("🔄 Recargar datos", use_container_width=True):
+        recargar_datos()
+        st.success("✅ Datos actualizados")
+        st.rerun()
 
 # Menú lateral
 menu = st.sidebar.selectbox(
@@ -383,7 +561,6 @@ if menu == "🏠 Dashboard":
     if not datos['clientes']:
         st.info("👋 No hay clientes registrados aún. Comienza agregando uno en 'Nuevo Cliente'")
     else:
-        # Métricas generales
         col1, col2, col3, col4 = st.columns(4)
         
         total_clientes = len(datos['clientes'])
@@ -411,7 +588,6 @@ if menu == "🏠 Dashboard":
         
         st.markdown("---")
         
-        # Métricas financieras
         col1, col2, col3 = st.columns(3)
         
         with col1:
@@ -423,7 +599,6 @@ if menu == "🏠 Dashboard":
         
         st.markdown("---")
         
-        # Progreso de pagos
         st.subheader("📊 Estado de Pagos por Cliente")
         
         clientes_list = []
@@ -442,7 +617,6 @@ if menu == "🏠 Dashboard":
         df_clientes = pd.DataFrame(clientes_list)
         st.dataframe(df_clientes, use_container_width=True, hide_index=True)
         
-        # Clientes con saldo pendiente
         st.markdown("---")
         st.subheader("⚠️ Clientes con Saldo Pendiente")
         
@@ -470,13 +644,12 @@ elif menu == "➕ Nuevo Cliente":
         with col2:
             asientos = st.number_input("🪑 Número de Asientos ($400)", min_value=0, value=1, step=1)
             st.markdown("**🏨 Habitaciones:**")
-            hab_sencillas = st.number_input("Sencillas ($600)", min_value=0, value=0, step=1)
-            hab_dobles = st.number_input("Dobles ($800)", min_value=0, value=0, step=1)
-            hab_triples = st.number_input("Triples ($1,000)", min_value=0, value=0, step=1)
+            hab_sencillas = st.number_input("Sencillas ($900)", min_value=0, value=0, step=1)
+            hab_dobles = st.number_input("Dobles ($1,150)", min_value=0, value=0, step=1)
+            hab_triples = st.number_input("Triples ($1,300)", min_value=0, value=0, step=1)
         
         notas = st.text_area("📝 Notas adicionales", placeholder="Información extra del cliente...")
         
-        # Calcular total
         total = calcular_total(asientos, hab_sencillas, hab_dobles, hab_triples)
         st.info(f"💰 **Total a pagar: ${total:,.2f}**")
         
@@ -489,7 +662,7 @@ elif menu == "➕ Nuevo Cliente":
                 st.error("❌ Debe seleccionar al menos un asiento o una habitación")
             else:
                 cliente_id = generar_id()
-                datos['clientes'][cliente_id] = {
+                nuevo_cliente = {
                     'nombre': nombre,
                     'telefono': telefono,
                     'email': email,
@@ -506,7 +679,12 @@ elif menu == "➕ Nuevo Cliente":
                     'notas': notas,
                     'fecha_registro': datetime.now().strftime("%d/%m/%Y %H:%M:%S")
                 }
-                guardar_datos(datos)
+                
+                # Guardar en Google Sheets
+                with st.spinner("Guardando en Google Sheets..."):
+                    guardar_cliente_sheets(cliente_id, nuevo_cliente)
+                    datos['clientes'][cliente_id] = nuevo_cliente
+                
                 st.success(f"✅ Cliente {nombre} registrado exitosamente con ID: {cliente_id}")
                 st.balloons()
 
@@ -519,7 +697,6 @@ elif menu == "✏️ Editar/Eliminar Cliente":
     if not datos['clientes']:
         st.warning("⚠️ No hay clientes registrados.")
     else:
-        # Selector de cliente
         clientes_opciones = {f"{cid} - {c['nombre']}": cid for cid, c in datos['clientes'].items()}
         cliente_seleccionado = st.selectbox("👤 Seleccionar Cliente", list(clientes_opciones.keys()))
         cliente_id = clientes_opciones[cliente_seleccionado]
@@ -547,7 +724,6 @@ elif menu == "✏️ Editar/Eliminar Cliente":
                 
                 nuevas_notas = st.text_area("📝 Notas", value=cliente.get('notas', ''))
                 
-                # Calcular nuevo total
                 nuevo_total = calcular_total(nuevos_asientos, nuevas_sencillas, nuevas_dobles, nuevas_triples)
                 st.info(f"💰 **Nuevo total a pagar: ${nuevo_total:,.2f}**")
                 
@@ -562,7 +738,6 @@ elif menu == "✏️ Editar/Eliminar Cliente":
                     elif nuevo_total == 0:
                         st.error("❌ Debe seleccionar al menos un asiento o una habitación")
                     else:
-                        # Actualizar datos
                         datos['clientes'][cliente_id]['nombre'] = nuevo_nombre
                         datos['clientes'][cliente_id]['telefono'] = nuevo_telefono
                         datos['clientes'][cliente_id]['email'] = nuevo_email
@@ -574,7 +749,9 @@ elif menu == "✏️ Editar/Eliminar Cliente":
                         datos['clientes'][cliente_id]['saldo_pendiente'] = nuevo_total - cliente['total_pagado']
                         datos['clientes'][cliente_id]['notas'] = nuevas_notas
                         
-                        guardar_datos(datos)
+                        with st.spinner("Actualizando en Google Sheets..."):
+                            guardar_cliente_sheets(cliente_id, datos['clientes'][cliente_id])
+                        
                         st.success(f"✅ Cliente {nuevo_nombre} actualizado exitosamente")
                         st.rerun()
         
@@ -594,8 +771,9 @@ elif menu == "✏️ Editar/Eliminar Cliente":
             
             with col2:
                 if st.button("🗑️ ELIMINAR CLIENTE", type="secondary", disabled=not confirmar, use_container_width=True):
-                    del datos['clientes'][cliente_id]
-                    guardar_datos(datos)
+                    with st.spinner("Eliminando de Google Sheets..."):
+                        eliminar_cliente_sheets(cliente_id)
+                        del datos['clientes'][cliente_id]
                     st.success(f"✅ Cliente eliminado exitosamente")
                     st.rerun()
 
@@ -608,7 +786,6 @@ elif menu == "💰 Registrar Pago":
     if not datos['clientes']:
         st.warning("⚠️ No hay clientes registrados. Primero agrega un cliente.")
     else:
-        # Selector de cliente
         clientes_opciones = {f"{cid} - {c['nombre']} (Saldo: ${c['saldo_pendiente']:,.2f})": cid 
                             for cid, c in datos['clientes'].items() if c['saldo_pendiente'] > 0}
         
@@ -619,7 +796,6 @@ elif menu == "💰 Registrar Pago":
             cliente_id = clientes_opciones[cliente_seleccionado]
             cliente = datos['clientes'][cliente_id]
             
-            # Mostrar información del cliente
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("💵 Total a Pagar", f"${cliente['total_a_pagar']:,.2f}")
@@ -630,7 +806,6 @@ elif menu == "💰 Registrar Pago":
             
             st.markdown("---")
             
-            # Formulario de pago
             with st.form("form_pago"):
                 col1, col2 = st.columns(2)
                 
@@ -656,7 +831,6 @@ elif menu == "💰 Registrar Pago":
                 submitted_pago = st.form_submit_button("💾 Registrar Pago", type="primary", use_container_width=True)
                 
                 if submitted_pago:
-                    # Registrar el pago
                     pago = {
                         'fecha': fecha_pago.strftime("%d/%m/%Y"),
                         'monto': monto,
@@ -670,7 +844,9 @@ elif menu == "💰 Registrar Pago":
                     cliente['total_pagado'] += monto
                     cliente['saldo_pendiente'] = cliente['total_a_pagar'] - cliente['total_pagado']
                     
-                    guardar_datos(datos)
+                    with st.spinner("Guardando pago en Google Sheets..."):
+                        agregar_pago_sheets(cliente_id, pago)
+                        actualizar_totales_cliente(cliente_id, cliente['total_pagado'], cliente['saldo_pendiente'])
                     
                     st.success(f"✅ Pago de ${monto:,.2f} registrado exitosamente")
                     
@@ -691,7 +867,6 @@ elif menu == "🗑️ Eliminar Pago":
     if not datos['clientes']:
         st.warning("⚠️ No hay clientes registrados.")
     else:
-        # Filtrar clientes que tienen pagos
         clientes_con_pagos = {f"{cid} - {c['nombre']}": cid 
                              for cid, c in datos['clientes'].items() if len(c['pagos']) > 0}
         
@@ -704,7 +879,6 @@ elif menu == "🗑️ Eliminar Pago":
             
             st.subheader(f"Pagos de {cliente['nombre']}")
             
-            # Mostrar pagos
             for idx, pago in enumerate(cliente['pagos']):
                 with st.expander(f"Pago #{idx+1} - ${pago['monto']:,.2f} - {pago['fecha']}"):
                     col1, col2 = st.columns([3, 1])
@@ -715,17 +889,23 @@ elif menu == "🗑️ Eliminar Pago":
                         st.write(f"**Método:** {pago['metodo']}")
                         st.write(f"**Referencia:** {pago['referencia']}")
                         st.write(f"**Notas:** {pago['notas']}")
-                        st.write(f"**Registrado:** {pago['timestamp']}")
+                        if pago.get('timestamp'):
+                            st.write(f"**Registrado:** {pago['timestamp']}")
                     
                     with col2:
                         if st.button(f"🗑️ Eliminar", key=f"del_pago_{idx}", type="secondary"):
-                            # Eliminar pago
                             monto_eliminado = pago['monto']
+                            
+                            with st.spinner("Eliminando pago de Google Sheets..."):
+                                eliminar_pago_sheets(cliente_id, idx)
+                            
                             cliente['pagos'].pop(idx)
                             cliente['total_pagado'] -= monto_eliminado
                             cliente['saldo_pendiente'] = cliente['total_a_pagar'] - cliente['total_pagado']
                             
-                            guardar_datos(datos)
+                            with st.spinner("Actualizando totales..."):
+                                actualizar_totales_cliente(cliente_id, cliente['total_pagado'], cliente['saldo_pendiente'])
+                            
                             st.success(f"✅ Pago de ${monto_eliminado:,.2f} eliminado")
                             st.rerun()
 
@@ -738,14 +918,12 @@ elif menu == "👥 Ver Clientes":
     if not datos['clientes']:
         st.info("👋 No hay clientes registrados aún.")
     else:
-        # Filtros
         col1, col2 = st.columns([3, 1])
         with col1:
             buscar = st.text_input("🔍 Buscar cliente", placeholder="Nombre, ID o teléfono...")
         with col2:
             filtro_estado = st.selectbox("Estado", ["Todos", "Liquidados", "Pendientes"])
         
-        # Filtrar clientes
         clientes_filtrados = datos['clientes'].copy()
         
         if buscar:
@@ -763,7 +941,6 @@ elif menu == "👥 Ver Clientes":
         
         st.markdown("---")
         
-        # Mostrar clientes
         for cliente_id, cliente in clientes_filtrados.items():
             with st.expander(f"**{cliente['nombre']}** - ID: {cliente_id} | Saldo: ${cliente['saldo_pendiente']:,.2f}"):
                 col1, col2 = st.columns(2)
@@ -790,11 +967,9 @@ elif menu == "👥 Ver Clientes":
                     st.metric("Total Pagado", f"${cliente['total_pagado']:,.2f}")
                     st.metric("Saldo Pendiente", f"${cliente['saldo_pendiente']:,.2f}")
                     
-                    # Barra de progreso
                     porcentaje = (cliente['total_pagado'] / cliente['total_a_pagar'] * 100) if cliente['total_a_pagar'] > 0 else 0
                     st.progress(porcentaje / 100, text=f"Pagado: {porcentaje:.1f}%")
                 
-                # Historial de pagos
                 if cliente['pagos']:
                     st.markdown("### 📜 Historial de Pagos")
                     df_pagos = pd.DataFrame(cliente['pagos'])
@@ -818,7 +993,6 @@ elif menu == "📊 Reportes":
         with tab1:
             st.subheader("Resumen General del Viaje")
             
-            # Preparar datos
             total_clientes = len(datos['clientes'])
             total_asientos = sum(c['asientos'] for c in datos['clientes'].values())
             total_hab_sencillas = sum(c['habitaciones']['sencillas'] for c in datos['clientes'].values())
@@ -852,9 +1026,13 @@ elif menu == "📊 Reportes":
             with col3:
                 st.metric("⏳ Saldo Pendiente", f"${saldo_pendiente:,.2f}")
             
-            # Desglose de ingresos
             st.markdown("---")
             st.subheader("💵 Desglose de Ingresos")
+            
+            total_asientos = sum(c['asientos'] for c in datos['clientes'].values())
+            total_hab_sencillas = sum(c['habitaciones']['sencillas'] for c in datos['clientes'].values())
+            total_hab_dobles = sum(c['habitaciones']['dobles'] for c in datos['clientes'].values())
+            total_hab_triples = sum(c['habitaciones']['triples'] for c in datos['clientes'].values())
             
             ingresos_transporte = total_asientos * TARIFAS['transporte']
             ingresos_sencillas = total_hab_sencillas * TARIFAS['habitacion_sencilla']
@@ -878,14 +1056,11 @@ elif menu == "📊 Reportes":
             
             st.dataframe(df_ingresos, use_container_width=True, hide_index=True)
             
-            # Exportar a Excel
             st.markdown("---")
             if st.button("📥 Exportar Reporte Completo a Excel"):
                 output = BytesIO()
                 
-                # Crear Excel con múltiples hojas
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    # Hoja 1: Clientes
                     clientes_export = []
                     for cid, c in datos['clientes'].items():
                         clientes_export.append({
@@ -904,7 +1079,6 @@ elif menu == "📊 Reportes":
                         })
                     pd.DataFrame(clientes_export).to_excel(writer, sheet_name='Clientes', index=False)
                     
-                    # Hoja 2: Pagos
                     pagos_export = []
                     for cid, c in datos['clientes'].items():
                         for pago in c['pagos']:
@@ -916,12 +1090,11 @@ elif menu == "📊 Reportes":
                                 'Método': pago['metodo'],
                                 'Referencia': pago['referencia'],
                                 'Notas': pago['notas'],
-                                'Timestamp': pago['timestamp']
+                                'Timestamp': pago.get('timestamp', '')
                             })
                     if pagos_export:
                         pd.DataFrame(pagos_export).to_excel(writer, sheet_name='Pagos', index=False)
                     
-                    # Hoja 3: Resumen
                     df_ingresos.to_excel(writer, sheet_name='Resumen Financiero', index=False)
                 
                 output.seek(0)
@@ -938,6 +1111,11 @@ elif menu == "📊 Reportes":
             st.subheader("🎫 Ocupación y Disponibilidad")
             
             st.info("📌 Esta sección te permitirá establecer capacidades máximas y ver disponibilidad")
+            
+            total_asientos = sum(c['asientos'] for c in datos['clientes'].values())
+            total_hab_sencillas = sum(c['habitaciones']['sencillas'] for c in datos['clientes'].values())
+            total_hab_dobles = sum(c['habitaciones']['dobles'] for c in datos['clientes'].values())
+            total_hab_triples = sum(c['habitaciones']['triples'] for c in datos['clientes'].values())
             
             col1, col2 = st.columns(2)
             with col1:
@@ -967,13 +1145,11 @@ elif menu == "📄 Kardex Individual":
     if not datos['clientes']:
         st.warning("⚠️ No hay clientes registrados.")
     else:
-        # Selector de cliente
         clientes_opciones = {f"{cid} - {c['nombre']}": cid for cid, c in datos['clientes'].items()}
         cliente_seleccionado = st.selectbox("👤 Seleccionar Cliente para Kardex", list(clientes_opciones.keys()))
         cliente_id = clientes_opciones[cliente_seleccionado]
         cliente = datos['clientes'][cliente_id]
         
-        # Vista previa del cliente
         col1, col2, col3 = st.columns(3)
         
         with col1:
@@ -985,7 +1161,6 @@ elif menu == "📄 Kardex Individual":
         
         st.markdown("---")
         
-        # Información que se incluirá en el Kardex
         st.subheader("📋 Contenido del Kardex")
         
         col1, col2 = st.columns(2)
@@ -1007,7 +1182,6 @@ elif menu == "📄 Kardex Individual":
         
         st.markdown("---")
         
-        # Selector de formato
         st.subheader("📥 Generar Kardex")
         
         formato = st.radio(
@@ -1018,7 +1192,6 @@ elif menu == "📄 Kardex Individual":
         
         col1, col2, col3 = st.columns(3)
         
-        # Botones según el formato seleccionado
         if formato == "📄 Solo PDF":
             with col2:
                 if st.button("📥 Generar PDF", type="primary", use_container_width=True):
@@ -1047,7 +1220,7 @@ elif menu == "📄 Kardex Individual":
                         )
                         st.success(f"✅ Kardex Excel de {cliente['nombre']} generado exitosamente")
         
-        else:  # PDF y Excel
+        else:
             with col2:
                 if st.button("📥 Generar Ambos Formatos", type="primary", use_container_width=True):
                     with st.spinner("Generando PDF y Excel..."):
@@ -1076,7 +1249,6 @@ elif menu == "📄 Kardex Individual":
                         
                         st.success(f"✅ Kardex de {cliente['nombre']} generado en ambos formatos exitosamente")
         
-        # Información adicional
         st.markdown("---")
         st.info("💡 **Tip:** El PDF es ideal para enviar por WhatsApp o email. El Excel te permite editar o imprimir con formato personalizado.")
 
@@ -1086,84 +1258,43 @@ elif menu == "📄 Kardex Individual":
 elif menu == "⚙️ Configuración":
     st.header("Configuración del Sistema")
     
-    with st.form("form_config"):
-        st.subheader("💵 Tarifas")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            tarifa_transporte = st.number_input(
-                "Transporte por persona", 
-                value=float(TARIFAS['transporte']),
-                min_value=0.0,
-                step=50.0
-            )
-            tarifa_sencilla = st.number_input(
-                "Habitación Sencilla", 
-                value=float(TARIFAS['habitacion_sencilla']),
-                min_value=0.0,
-                step=50.0
-            )
-        
-        with col2:
-            tarifa_doble = st.number_input(
-                "Habitación Doble", 
-                value=float(TARIFAS['habitacion_doble']),
-                min_value=0.0,
-                step=50.0
-            )
-            tarifa_triple = st.number_input(
-                "Habitación Triple", 
-                value=float(TARIFAS['habitacion_triple']),
-                min_value=0.0,
-                step=50.0
-            )
-        
-        st.markdown("---")
-        st.subheader("📅 Información del Viaje")
-        
-        fecha_viaje = st.date_input("Fecha del Viaje", value=date.today())
-        
-        submitted_config = st.form_submit_button("💾 Guardar Configuración", type="primary")
-        
-        if submitted_config:
-            TARIFAS['transporte'] = tarifa_transporte
-            TARIFAS['habitacion_sencilla'] = tarifa_sencilla
-            TARIFAS['habitacion_doble'] = tarifa_doble
-            TARIFAS['habitacion_triple'] = tarifa_triple
-            
-            datos['configuracion'] = TARIFAS
-            datos['fecha_viaje'] = fecha_viaje.strftime("%d/%m/%Y")
-            
-            guardar_datos(datos)
-            st.success("✅ Configuración guardada exitosamente")
+    st.info("💡 Las tarifas se configuran directamente en el código. Para cambiarlas, modifica los valores en la sección TARIFAS del archivo.")
+    
+    st.subheader("📋 Tarifas Actuales")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write(f"**Transporte por persona:** ${TARIFAS['transporte']:,.2f}")
+        st.write(f"**Habitación Sencilla:** ${TARIFAS['habitacion_sencilla']:,.2f}")
+    with col2:
+        st.write(f"**Habitación Doble:** ${TARIFAS['habitacion_doble']:,.2f}")
+        st.write(f"**Habitación Triple:** ${TARIFAS['habitacion_triple']:,.2f}")
     
     st.markdown("---")
-    st.subheader("🗑️ Zona de Peligro")
+    st.subheader("🔗 Estado de Conexión")
     
-    col1, col2 = st.columns(2)
+    try:
+        client = conectar_google_sheets()
+        spreadsheet = client.open("viaje_san_juan_data")
+        st.success(f"✅ Conectado a Google Sheets: **{spreadsheet.title}**")
+        st.write(f"📄 URL: {spreadsheet.url}")
+        
+        hojas = spreadsheet.worksheets()
+        for hoja in hojas:
+            st.write(f"  - Hoja: **{hoja.title}** ({hoja.row_count} filas)")
+    except Exception as e:
+        st.error(f"❌ Error de conexión: {e}")
     
-    with col1:
-        if st.button("🔄 Reiniciar Datos", type="secondary", use_container_width=True):
-            if st.checkbox("⚠️ Confirmo que quiero borrar TODOS los datos"):
-                datos['clientes'] = {}
-                guardar_datos(datos)
-                st.success("✅ Datos reiniciados")
-                st.rerun()
+    st.markdown("---")
+    st.subheader("📥 Respaldar Datos")
     
-    with col2:
-        if st.button("📥 Respaldar Datos", use_container_width=True):
-            backup_filename = f"backup_viaje_{datetime.now().strftime('%d-%m-%Y_%H%M%S')}.json"
-            with open(backup_filename, 'w', encoding='utf-8') as f:
-                json.dump(datos, f, indent=2, ensure_ascii=False)
-            
-            with open(backup_filename, 'rb') as f:
-                st.download_button(
-                    label="⬇️ Descargar Respaldo",
-                    data=f,
-                    file_name=backup_filename,
-                    mime="application/json"
-                )
+    if st.button("📥 Descargar Respaldo JSON", use_container_width=True):
+        backup_data = json.dumps(datos, indent=2, ensure_ascii=False)
+        st.download_button(
+            label="⬇️ Descargar Respaldo",
+            data=backup_data,
+            file_name=f"backup_viaje_{datetime.now().strftime('%d-%m-%Y_%H%M%S')}.json",
+            mime="application/json"
+        )
 
 # Footer
 st.markdown("---")
@@ -1171,6 +1302,7 @@ st.markdown(
     """
     <div style='text-align: center; color: gray;'>
     🚌 Sistema de Gestión de Viajes | Desarrollado para viaje a Viaje San Juan de los Lagos dia Miercoles 01 abril 2026
+    <br><small>📡 Conectado a Google Sheets</small>
     </div>
     """,
     unsafe_allow_html=True
