@@ -133,7 +133,7 @@ def guardar_cliente_sheets(cliente_id, cliente):
         # Actualizar fila existente
         rango = f"A{celda.row}:M{celda.row}"
         hoja_clientes.update(rango, [fila])
-    except gspread.exceptions.CellNotFound:
+    except Exception:
         # Agregar nueva fila
         hoja_clientes.append_row(fila)
 
@@ -145,7 +145,7 @@ def eliminar_cliente_sheets(cliente_id):
     try:
         celda = hoja_clientes.find(cliente_id, in_column=1)
         hoja_clientes.delete_rows(celda.row)
-    except gspread.exceptions.CellNotFound:
+    except Exception:
         pass
     
     # Eliminar pagos del cliente
@@ -200,7 +200,7 @@ def actualizar_totales_cliente(cliente_id, total_pagado, saldo_pendiente):
         # Columnas J (total_pagado) y K (saldo_pendiente) = columnas 10 y 11
         hoja_clientes.update_cell(celda.row, 10, total_pagado)
         hoja_clientes.update_cell(celda.row, 11, saldo_pendiente)
-    except gspread.exceptions.CellNotFound:
+    except Exception:
         pass
 
 # ============================================
