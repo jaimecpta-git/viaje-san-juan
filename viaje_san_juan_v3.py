@@ -19,6 +19,30 @@ st.set_page_config(
     layout="wide"
 )
 
+# ============================================
+# AUTENTICACIÓN
+# ============================================
+def verificar_password():
+    """Verifica que el usuario ingrese la contraseña correcta."""
+    if "autenticado" not in st.session_state:
+        st.session_state.autenticado = False
+    
+    if not st.session_state.autenticado:
+        st.title("🚌 Viaje San Juan de los Lagos")
+        st.markdown("---")
+        password_input = st.text_input("🔒 Ingresa la contraseña:", type="password")
+        if st.button("Entrar", type="primary"):
+            if password_input == st.secrets["passwords"]["password"]:
+                st.session_state.autenticado = True
+                st.rerun()
+            else:
+                st.error("❌ Contraseña incorrecta")
+        return False
+    return True
+
+if not verificar_password():
+    st.stop()
+
 # Configuración de tarifas
 TARIFAS = {
     'transporte': 400,
