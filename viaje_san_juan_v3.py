@@ -47,7 +47,7 @@ if not verificar_password():
 TARIFAS = {
     'transporte': 400,
     'habitacion_sencilla': 900,
-    'habitacion_doble': 1150,
+    'habitacion_doble': 1100,
     'habitacion_triple': 1300
 }
 
